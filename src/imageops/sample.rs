@@ -1005,6 +1005,10 @@ pub fn resize<I: GenericImageView>(
         return tmp;
     }
 
+    if filter == FilterType::Nearest {
+        return resize_nearest(image, nwidth, nheight);
+    }
+
     let mut method = match filter {
         FilterType::Nearest => Filter {
             kernel: Box::new(box_kernel),
@@ -1031,6 +1035,53 @@ pub fn resize<I: GenericImageView>(
     // Note: tmp is not necessarily actually Rgba
     let tmp: Rgba32FImage = vertical_sample(image, nheight, &mut method);
     horizontal_sample(&tmp, nwidth, &mut method)
+}
+
+/// Nearest neighbor resampling.
+///
+/// This selects exactly the pixels that [`vertical_sample`] and [`horizontal_sample`] select
+/// for a [`box_kernel`] of zero support (the source pixel containing the centre of each output
+/// pixel), and the same conversion is applied to every channel. It does so without
+/// converting the whole image to `Rgba32FImage` and without evaluating a kernel per pixel.
+fn resize_nearest<I: GenericImageView>(
+    image: &I,
+    nwidth: u32,
+    nheight: u32,
+) -> ImageBuffer<I::Pixel, Vec<<I::Pixel as Pixel>::Subpixel>> {
+    let (width, height) = image.dimensions();
+    debug_assert!(width != 0 && height != 0 && (nwidth, nheight) != (width, height));
+
+    let mut out = ImageBuffer::new(nwidth, nheight);
+    out.copy_color_space_from(&image.buffer_with_dimensions(0, 0));
+
+    // Keep the arithmetic (f32 ratio, f64 horizontally, f32 vertically) identical to the
+    // generic samplers so that both select the same source pixel everywhere.
+    let x_ratio = width as f32 / nwidth as f32;
+    let columns: Vec<u32> = (0..nwidth)
+        .map(|outx| {
+            let inputx = (outx as f64 + 0.5) * x_ratio as f64;
+            clamp(inputx as u32, 0, width - 1)
+        })
+        .collect();
+
+    let y_ratio = height as f32 / nheight as f32;
+    for outy in 0..nheight {
+        let inputy = (outy as f32 + 0.5) * y_ratio;
+        let srcy = clamp(inputy.floor() as i64, 0, <i64 as From<_>>::from(height) - 1) as u32;
+
+        for (outx, &srcx) in columns.iter().enumerate() {
+            let pixel = image.get_pixel(srcx, srcy).map(|c| {
+                // The generic path round-trips through f32, which also clamps floating point
+                // channels to [0, 1] and maps NaN to 0.
+                <I::Pixel as Pixel>::Subpixel::clamp_nearest_from(
+                    <f32 as NumCast>::from(c).unwrap(),
+                )
+            });
+            out.put_pixel(outx as u32, outy, pixel);
+        }
+    }
+
+    out
 }
 
 /// Performs a Gaussian blur on the supplied image.
@@ -1978,6 +2029,170 @@ mod tests {
                     out.pixels().iter().all(|p| *p == crate::Luma([77])),
                     "{filter:?} Luma8 {width}x{height}"
                 );
+            }
+        }
+    }
+
+    /// Tests for the dedicated `FilterType::Nearest` implementation.
+    mod nearest_resize {
+        use super::super::{
+            box_kernel, horizontal_sample, resize, vertical_sample, Filter, FilterType,
+        };
+        use crate::math::Rect;
+        use crate::{
+            GenericImageView, ImageBuffer, Luma, LumaA, Pixel, Rgb, RgbImage, Rgba, Rgba32FImage,
+        };
+        use num_traits::ToPrimitive;
+
+        /// The generic box-kernel pipeline that `resize` used for `FilterType::Nearest` before
+        /// it got a dedicated implementation. It is the reference the fast path must reproduce.
+        fn nearest_via_generic_samplers<I: GenericImageView>(
+            image: &I,
+            width: u32,
+            height: u32,
+        ) -> ImageBuffer<I::Pixel, Vec<<I::Pixel as Pixel>::Subpixel>> {
+            let mut method = Filter {
+                kernel: Box::new(box_kernel),
+                support: 0.0,
+            };
+            let tmp: Rgba32FImage = vertical_sample(image, height, &mut method);
+            horizontal_sample(&tmp, width, &mut method)
+        }
+
+        fn assert_same_subpixels<P: Pixel>(
+            label: &str,
+            got: &ImageBuffer<P, Vec<P::Subpixel>>,
+            want: &ImageBuffer<P, Vec<P::Subpixel>>,
+        ) {
+            assert_eq!(got.dimensions(), want.dimensions(), "{label}: dimensions");
+            for (i, (a, b)) in got.as_raw().iter().zip(want.as_raw()).enumerate() {
+                // compare bit patterns so that floats must match exactly
+                assert_eq!(
+                    a.to_f64().unwrap().to_bits(),
+                    b.to_f64().unwrap().to_bits(),
+                    "{label}: subpixel {i}"
+                );
+            }
+        }
+
+        fn xorshift(mut state: u32) -> impl FnMut() -> u32 {
+            move || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state
+            }
+        }
+
+        /// (source width, source height, new width, new height)
+        const SIZES: &[(u32, u32, u32, u32)] = &[
+            (1, 1, 5, 3),
+            (7, 5, 7, 3),
+            (7, 5, 3, 5),
+            (10, 10, 25, 25),
+            (64, 48, 100, 7),
+            (101, 77, 33, 21),
+            (200, 100, 3, 3),
+            (3, 200, 9, 1),
+            // large and awkward ratios where f32 rounding of the ratio matters
+            (4096, 3, 1333, 3),
+            (3000, 2000, 7, 5),
+            (5, 5, 4096, 3),
+            (4093, 31, 997, 7),
+            (1920, 1080, 400, 300),
+        ];
+
+        fn assert_matches_generic<P: Pixel>(
+            label: &str,
+            mut make_pixel: impl FnMut(&mut dyn FnMut() -> u32) -> P,
+        ) {
+            let mut next = xorshift(0x9E37_79B9);
+            for &(sw, sh, dw, dh) in SIZES {
+                let img = ImageBuffer::from_fn(sw, sh, |_, _| make_pixel(&mut next));
+                let got = resize(&img, dw, dh, FilterType::Nearest);
+                let want = nearest_via_generic_samplers(&img, dw, dh);
+                assert_same_subpixels(&format!("{label} {sw}x{sh}->{dw}x{dh}"), &got, &want);
+            }
+        }
+
+        #[test]
+        fn matches_generic_sampling_for_integer_pixels() {
+            assert_matches_generic("Rgba8", |n| {
+                Rgba([n() as u8, n() as u8, n() as u8, n() as u8])
+            });
+            assert_matches_generic("Rgb8", |n| Rgb([n() as u8, n() as u8, n() as u8]));
+            assert_matches_generic("LumaA8", |n| LumaA([n() as u8, n() as u8]));
+            assert_matches_generic("Luma16", |n| Luma([n() as u16]));
+            assert_matches_generic("Rgba16", |n| {
+                Rgba([n() as u16, n() as u16, n() as u16, n() as u16])
+            });
+        }
+
+        #[test]
+        fn matches_generic_sampling_for_float_pixels() {
+            // Includes values outside [0, 1] and NaN, which the generic path clamps / maps to 0.
+            let channel = |n: &mut dyn FnMut() -> u32| {
+                let v = n();
+                if v & 0xF == 0 {
+                    f32::NAN
+                } else {
+                    (v % 1000) as f32 / 250.0 - 2.0
+                }
+            };
+            assert_matches_generic("Rgba32F", |n| {
+                Rgba([channel(n), channel(n), channel(n), channel(n)])
+            });
+            assert_matches_generic("Luma32F", |n| Luma([channel(n)]));
+        }
+
+        #[test]
+        fn matches_generic_sampling_for_every_small_size_pair() {
+            let mut next = xorshift(0xC0FF_EE11);
+            for sw in 1..=70u32 {
+                for dw in 1..=70u32 {
+                    let row = ImageBuffer::from_fn(sw, 1, |_, _| Luma([next() as u8]));
+                    assert_same_subpixels(
+                        &format!("row {sw}->{dw}"),
+                        &resize(&row, dw, 1, FilterType::Nearest),
+                        &nearest_via_generic_samplers(&row, dw, 1),
+                    );
+                    let column = ImageBuffer::from_fn(1, sw, |_, _| Luma([next() as u8]));
+                    assert_same_subpixels(
+                        &format!("column {sw}->{dw}"),
+                        &resize(&column, 1, dw, FilterType::Nearest),
+                        &nearest_via_generic_samplers(&column, 1, dw),
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn matches_generic_sampling_for_sub_images() {
+            let mut next = xorshift(0x1234_5678);
+            let img = ImageBuffer::from_fn(90, 70, |_, _| {
+                Rgb([next() as u8, next() as u8, next() as u8])
+            });
+            let view = img.view(Rect {
+                x: 11,
+                y: 7,
+                width: 53,
+                height: 41,
+            });
+            assert_same_subpixels(
+                "sub image",
+                &resize(&*view, 20, 60, FilterType::Nearest),
+                &nearest_via_generic_samplers(&*view, 20, 60),
+            );
+        }
+
+        #[test]
+        fn resizing_to_an_empty_image_matches_generic_sampling() {
+            let img = RgbImage::from_pixel(8, 6, Rgb([1, 2, 3]));
+            for (w, h) in [(0, 4), (4, 0), (0, 0)] {
+                let got = resize(&img, w, h, FilterType::Nearest);
+                let want = nearest_via_generic_samplers(&img, w, h);
+                assert_eq!(got.dimensions(), want.dimensions());
+                assert!(got.as_raw().is_empty());
             }
         }
     }
